@@ -1314,6 +1314,9 @@ uint32 Unit::DealDamage(Unit* attacker, Unit* victim, uint32 damage, CleanDamage
         if (!victim->ToCreature()->hasLootRecipient())
             victim->ToCreature()->SetLootRecipient(attacker);
 
+        if (damage && attacker && attacker->IsPlayer())
+            victim->ToCreature()->AddDirectPlayerAttacker(attacker->GetGUID());
+
         if (!attacker || attacker->IsControlledByPlayer() || attacker->IsCreatedByPlayer())
         {
             uint32 unDamage = health < damage ? health : damage;
@@ -4954,6 +4957,8 @@ bool Unit::CanCastSpellWhileMoving(SpellInfo const* info) const
     // Its aura 313 family differs from CoA class spells such as Elemental Burst.
     if (HasManastormMovementGrace())
         return true;
+    if (HasFormLandingGrace())
+        return true;
     // Ascension Fire Walk With Me (Warcraft Reborn Mystic Enchant): "your Scorch can be cast while moving"
     if (IsPlayer() && info->SpellFamilyName == SPELLFAMILY_MAGE && (info->SpellFamilyFlags[0] & 0x10) && HasAura(1584166))
         return true;
@@ -6150,6 +6155,18 @@ void Unit::RemoveNotOwnSingleTargetAuras()
         else
             ++iter;
     }
+}
+
+void Unit::GrantFormLandingGrace(Milliseconds duration)
+{
+    _formLandingGraceEnd = GameTime::GetGameTimeMS() + duration;
+}
+
+bool Unit::HasFormLandingGrace() const
+{
+    // Settling after a hovering form ends only moves the unit vertically; walking or strafing still interrupts.
+    return IsPlayer() && GameTime::GetGameTimeMS() < _formLandingGraceEnd &&
+        !m_movementInfo.HasMovementFlag(MOVEMENTFLAG_MASK_MOVING & ~(MOVEMENTFLAG_FALLING | MOVEMENTFLAG_FALLING_FAR));
 }
 
 bool Unit::HasManastormMovementGrace() const
@@ -9173,7 +9190,8 @@ void Unit::SendHealSpellLog(HealInfo const& healInfo, bool critical)
 
 int32 Unit::HealBySpell(HealInfo& healInfo, bool critical)
 {
-    uint32 heal = healInfo.GetHeal();
+    uint32 heal = LocalLevelScaling::HealReceivedFor(healInfo.GetHealer(), healInfo.GetTarget(),
+        healInfo.GetSpellInfo(), healInfo.GetHeal());
     sScriptMgr->ModifyHealReceived(this, healInfo.GetTarget(), heal, healInfo.GetSpellInfo());
     healInfo.SetHeal(heal);
 
@@ -15463,10 +15481,14 @@ void Unit::Kill(Unit* killer, Unit* victim, bool durabilityLoss, WeaponAttackTyp
             loot->clear();
             creature->FinalizeSharedQuestParticipants();
 
-            uint32 const lootid = creature->GetCreatureTemplate()->lootid;
-            loot->FillLoot(lootid, LootTemplates_Creature, looter, false, !lootid, creature->GetLootMode(), creature);
+            bool const unearnedSoloKill = !group && sWorld->getBoolConfig(CONFIG_SOLO_KILL_REQUIRES_PLAYER_HIT) &&
+                !creature->WasAttackedDirectlyBy(looter->GetGUID());
 
-            if (creature->GetLootMode())
+            uint32 const lootid = creature->GetCreatureTemplate()->lootid;
+            if (!unearnedSoloKill)
+                loot->FillLoot(lootid, LootTemplates_Creature, looter, false, !lootid, creature->GetLootMode(), creature);
+
+            if (creature->GetLootMode() && !unearnedSoloKill)
                 loot->generateMoneyLoot(creature->GetCreatureTemplate()->mingold, creature->GetCreatureTemplate()->maxgold);
 
             if (group)
@@ -16377,7 +16399,31 @@ void Unit::RemoveCharmedBy(Unit* charmer)
 
     // a guardian should always have charminfo
     if (playerCharmer && this != charmer->GetFirstControlled())
-        playerCharmer->SendRemoveControlBar();
+    {
+        // Restore the bar of a pet or guardian still controlled after the charm ends
+        Unit* controlled = charmer->GetFirstControlled();
+        if (controlled && controlled->GetCharmInfo())
+        {
+            if (controlled->IsPet())
+                playerCharmer->PetSpellInitialize();
+            else
+                playerCharmer->CharmSpellInitialize();
+
+            playerCharmer->m_Events.AddEventAtOffset([playerCharmer]()
+            {
+                if (Unit* lateControlled = playerCharmer->GetFirstControlled();
+                    lateControlled && lateControlled->GetCharmInfo())
+                {
+                    if (lateControlled->IsPet())
+                        playerCharmer->PetSpellInitialize();
+                    else
+                        playerCharmer->CharmSpellInitialize();
+                }
+            }, 250ms);
+        }
+        else
+            playerCharmer->SendRemoveControlBar();
+    }
 
     // xinef: Always delete charm info (restores react state)
     if (IsPlayer() || (IsCreature() && !ToCreature()->IsGuardian()))
